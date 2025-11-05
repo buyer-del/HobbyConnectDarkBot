@@ -180,9 +180,13 @@ def webhook():
 # -----------------------
 if __name__ == "__main__":
     async def run_bot():
-        await application.initialize()
-        await application.start()
-        logger.info("✅ Telegram application started (webhook mode)")
+    await application.initialize()
+    await application.start()
+    logger.info("✅ Telegram application started (webhook mode)")
+    # нескінченний цикл, щоб не завершувався
+    while True:
+        await asyncio.sleep(60)
+
 
     def start_bot():
         asyncio.run(run_bot())
