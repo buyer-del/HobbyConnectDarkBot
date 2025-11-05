@@ -1,0 +1,9 @@
+python-telegram-bot==20.3
+google-cloud-speech
+google-cloud-vision
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+pydub
+flask
