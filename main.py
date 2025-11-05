@@ -218,3 +218,16 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Запуск Flask на порті {port}")
     app.run(host="0.0.0.0", port=port)
+# 🧩 Додатково: запуск Telegram-бота окремим циклом
+if __name__ == "__main__":
+    import threading
+
+    def start_bot():
+        asyncio.run(run_bot())
+
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Запуск Flask на порті {port}")
+    app.run(host="0.0.0.0", port=port)
