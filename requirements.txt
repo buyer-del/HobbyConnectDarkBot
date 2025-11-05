@@ -7,3 +7,4 @@ google-auth-oauthlib
 google-auth-httplib2
 pydub
 flask
+pyaudioop==0.1.2
