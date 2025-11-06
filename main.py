@@ -133,14 +133,11 @@ async def buttons(update, context):
 # ======================
 # FLASK WEBHOOK
 # ======================
-@app.route("/webhook", methods=["POST"])
+@flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
+    data = request.get_json(force=True)
     update = Update.de_json(data, bot_app.bot)
-   import asyncio
-asyncio.run(bot_app.process_update(update))
-
-
+    bot_app.update_queue.put_nowait(update)
     return "ok"
 
 
