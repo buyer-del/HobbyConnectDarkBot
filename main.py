@@ -137,7 +137,10 @@ async def buttons(update, context):
 def webhook():
     data = request.get_json()
     update = Update.de_json(data, bot_app.bot)
-    bot_app.update_queue.put_nowait(update)
+   import asyncio
+asyncio.run(bot_app.process_update(update))
+
+
     return "ok"
 
 
