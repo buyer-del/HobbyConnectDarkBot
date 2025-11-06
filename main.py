@@ -26,7 +26,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # Flask
 flask_app = Flask(__name__)
 
-# Telegram Application
+# Telegram App
 bot_app = Application.builder().token(TOKEN).build()
 
 
@@ -35,35 +35,34 @@ bot_app = Application.builder().token(TOKEN).build()
 # -------------------------
 
 def _buf(context):
-    """Буфер для тимчасового зберігання тексту перед створенням задачі."""
+    """Буфер для чернетки."""
     if "buffer" not in context.user_data:
         context.user_data["buffer"] = []
     return context.user_data["buffer"]
 
 
 def _kb():
-    """Клавіатура з кнопками."""
+    """Кнопки."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Додати текст", callback_data="add_text")],
         [InlineKeyboardButton("📌 Створити задачу", callback_data="new_task")],
         [InlineKeyboardButton("🧹 Очистити", callback_data="clear_buf")],
     ])
 
 
 # -------------------------
-# СТАРТ
+# /start
 # -------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот працює. Надішли текст, фото або голосове повідомлення.\n"
-        "Можеш зібрати чернетку та натиснути «Створити задачу».",
+        "Бот працює. Надішли текст, фото або голос. "
+        "Усе піде в чернетку. Коли готово — натисни «Створити задачу».",
         reply_markup=_kb(),
     )
 
 
 # -------------------------
-# ОБРОБКА ЗВИЧАЙНИХ ПОВІДОМЛЕНЬ
+# ОБРОБКА ПОВІДОМЛЕНЬ
 # -------------------------
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -78,7 +77,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = _buf(context)
-
     try:
         file = await update.message.photo[-1].get_file()
         local_path = "photo.jpg"
@@ -91,7 +89,6 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🖼 Текст із фото додано.",
             reply_markup=_kb(),
         )
-
     except Exception as e:
         logger.exception(e)
         await update.message.reply_text("❌ Помилка розпізнавання фото.")
@@ -99,7 +96,6 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = _buf(context)
-
     try:
         file = await update.message.voice.get_file()
         local_path = "voice.ogg"
@@ -109,10 +105,9 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf.append(text)
 
         await update.message.reply_text(
-            "🎤 Розпізнано і додано до чернетки.",
+            "🎤 Голос розпізнано й додано.",
             reply_markup=_kb(),
         )
-
     except Exception as e:
         logger.exception(e)
         await update.message.reply_text("❌ Помилка розпізнавання голосу.")
@@ -124,16 +119,15 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     buf = _buf(context)
 
-    # Очистити буфер
+    # Очищення
     if q.data == "clear_buf":
         buf.clear()
         await q.message.reply_text("🧹 Чернетку очищено.", reply_markup=_kb())
         return
 
-    # Створити задачу
+    # Створення задачі
     if q.data == "new_task":
         if not buf:
             await q.message.reply_text("⚠️ Чернетка порожня.", reply_markup=_kb())
@@ -158,7 +152,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    """Точка входу від Telegram."""
     data = request.get_json(force=True)
     update = Update.de_json(data, bot_app.bot)
     bot_app.update_queue.put_nowait(update)
@@ -169,13 +162,10 @@ def webhook():
 # ЗАПУСК
 # -------------------------
 
-async def run_webhook():
-    await bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-
-
 def start_bot():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CallbackQueryHandler(buttons))
+
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, photo_message))
     bot_app.add_handler(MessageHandler(filters.VOICE, voice_message))
@@ -190,8 +180,3 @@ def start_bot():
 
 if __name__ == "__main__":
     start_bot()
-
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Запуск Flask на порті {port}")
-    app.run(host="0.0.0.0", port=port)
-
