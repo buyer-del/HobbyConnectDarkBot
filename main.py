@@ -1,159 +1,166 @@
 import os
 import logging
-import asyncio
+from flask import Flask, request
 from telegram import (
     Update,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from ai import transcribe_audio, extract_text_from_image
 from sheets_api import append_task
 
-# ---------- Логування ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ======================
+# ЛОГИ
+# ======================
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Змінні середовища ----------
+# ======================
+# ЗМІННІ
+# ======================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", "10000"))
 
-if not TOKEN:
-    raise SystemExit("TELEGRAM_BOT_TOKEN не задано")
-if not WEBHOOK_URL or not WEBHOOK_URL.startswith("https://"):
-    raise SystemExit("WEBHOOK_URL не задано або не HTTPS (приклад: https://<name>.onrender.com)")
+app = Flask(__name__)  # Flask-сервер
 
-# ---------- Telegram Application ----------
+# Telegram App
 bot_app = Application.builder().token(TOKEN).build()
 
-# ---------- Допоміжне ----------
-def _buf(context: ContextTypes.DEFAULT_TYPE) -> list:
+
+# ======================
+# ДОПОМІЖНЕ
+# ======================
+def _buf(context):
     return context.user_data.setdefault("buffer", [])
 
-def _kb() -> InlineKeyboardMarkup:
+
+def _kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📌 Створити задачу", callback_data="new_task")],
         [InlineKeyboardButton("🧹 Очистити", callback_data="clear_buf")],
     ])
 
-# ---------- Команди ----------
+
+# ======================
+# КОМАНДИ
+# ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот працює. Надішли текст, фото або голос. "
-        "Усе піде в чернетку. Коли готово — натисни «Створити задачу».",
+        "Бот працює. Можеш надсилати текст, фото або голос. "
+        "Усе додається у чернетку.",
         reply_markup=_kb(),
     )
+
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Бот онлайн")
 
-# ---------- Повідомлення ----------
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buf = _buf(context)
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    buf.append(text)
-    await update.message.reply_text("✅ Текст додано у чернетку.", reply_markup=_kb())
 
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buf = _buf(context)
+# ======================
+# ПОВІДОМЛЕННЯ
+# ======================
+async def text_message(update, context):
+    _buf(context).append(update.message.text)
+    await update.message.reply_text("✅ Додано в чернетку.", reply_markup=_kb())
+
+
+async def photo_message(update, context):
     file = await update.message.photo[-1].get_file()
-    local_path = "photo.jpg"
-    await file.download_to_drive(local_path)
+    path = "photo.jpg"
+    await file.download_to_drive(path)
     try:
-        # якщо extract_text_from_image блокуюча — перенести у пул
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, extract_text_from_image, local_path)
-        text = (text or "").strip()
-        if text:
-            buf.append(text)
-            await update.message.reply_text("🖼 Текст із фото додано.", reply_markup=_kb())
-        else:
-            await update.message.reply_text("😕 Текст на зображенні не знайдено.", reply_markup=_kb())
-    except Exception as e:
-        logger.exception("Помилка OCR: %s", e)
+        text = extract_text_from_image(path)
+        _buf(context).append(text)
+        await update.message.reply_text("🖼 Текст із фото додано.", reply_markup=_kb())
+    except Exception:
         await update.message.reply_text("❌ Помилка розпізнавання фото.")
     finally:
-        try:
-            os.remove(local_path)
-        except Exception:
-            pass
+        try: os.remove(path)
+        except: pass
 
-async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buf = _buf(context)
+
+async def voice_message(update, context):
     file = await update.message.voice.get_file()
-    local_path = "voice.ogg"
-    await file.download_to_drive(local_path)
+    path = "voice.ogg"
+    await file.download_to_drive(path)
     try:
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, transcribe_audio, local_path)
-        text = (text or "").strip()
-        if text:
-            buf.append(text)
-            await update.message.reply_text("🎤 Голос розпізнано й додано.", reply_markup=_kb())
-        else:
-            await update.message.reply_text("😕 Не вдалося розпізнати мову.", reply_markup=_kb())
-    except Exception as e:
-        logger.exception("Помилка STT: %s", e)
-        await update.message.reply_text("❌ Помилка розпізнавання голосу.")
+        text = transcribe_audio(path)
+        _buf(context).append(text)
+        await update.message.reply_text("🎤 Голос додано.", reply_markup=_kb())
+    except Exception:
+        await update.message.reply_text("❌ Помилка голосу.")
     finally:
-        try:
-            os.remove(local_path)
-        except Exception:
-            pass
+        try: os.remove(path)
+        except: pass
 
-# ---------- Кнопки ----------
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# ======================
+# КНОПКИ
+# ======================
+async def buttons(update, context):
     q = update.callback_query
-    data = q.data
     buf = _buf(context)
 
-    if data == "clear_buf":
+    if q.data == "clear_buf":
         buf.clear()
         await q.message.reply_text("🧹 Чернетку очищено.", reply_markup=_kb())
         return
 
-    if data == "new_task":
+    if q.data == "new_task":
         if not buf:
             await q.message.reply_text("⚠️ Чернетка порожня.", reply_markup=_kb())
             return
+
         text = "\n".join(buf)
         try:
             append_task("Задача", text, "#інше")
             await q.message.reply_text("✅ Задачу створено!", reply_markup=_kb())
-        except Exception as e:
-            logger.exception("Помилка запису у таблицю: %s", e)
-            await q.message.reply_text("❌ Помилка запису у таблицю.")
+        except Exception:
+            await q.message.reply_text("❌ Помилка запису.")
         buf.clear()
         return
 
-# ---------- Запуск ----------
-def start_bot():
+
+# ======================
+# FLASK WEBHOOK
+# ======================
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    update = Update.de_json(data, bot_app.bot)
+    bot_app.update_queue.put_nowait(update)
+    return "ok"
+
+
+# ======================
+# ЗАПУСК
+# ======================
+def main():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
-    bot_app.add_handler(CallbackQueryHandler(buttons))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, photo_message))
     bot_app.add_handler(MessageHandler(filters.VOICE, voice_message))
+    bot_app.add_handler(CallbackQueryHandler(buttons))
 
-    # Критично: шлях повинен збігатися з тим, що реєструємо у Telegram
-    bot_app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"{WEBHOOK_URL}/webhook",
-        webhook_path="/webhook",          # ← це усуває 404
-        drop_pending_updates=True,
+    # Встановлюємо вебхук
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
     )
 
-if __name__ == "__main__":
-    start_bot()
+    # Запускаємо Flask (Render вимагає запуск сервера)
+    app.run(host="0.0.0.0", port=PORT)
 
+
+if __name__ == "__main__":
+    main()
