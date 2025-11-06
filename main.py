@@ -1,197 +1,195 @@
 import os
 import logging
-import asyncio
-import threading
 from flask import Flask, request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 from ai import transcribe_audio, extract_text_from_image
 from sheets_api import append_task
 
-# -----------------------
-# ЛОГУВАННЯ
-# -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------
-# ЗМІННІ СЕРЕДОВИЩА
-# -----------------------
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit("❌ TELEGRAM_BOT_TOKEN не знайдено у змінних середовища")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# -----------------------
-# ІНІЦІАЛІЗАЦІЯ
-# -----------------------
-app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+# Flask
+flask_app = Flask(__name__)
 
-# -----------------------
-# ДОПОМОЖНІ ФУНКЦІЇ
-# -----------------------
-def _buf(context: ContextTypes.DEFAULT_TYPE) -> list:
-    return context.user_data.setdefault("buffer", [])
+# Telegram Application
+bot_app = Application.builder().token(TOKEN).build()
 
-def _kb() -> InlineKeyboardMarkup:
+
+# -------------------------
+# ВНУТРІШНІ ФУНКЦІЇ
+# -------------------------
+
+def _buf(context):
+    """Буфер для тимчасового зберігання тексту перед створенням задачі."""
+    if "buffer" not in context.user_data:
+        context.user_data["buffer"] = []
+    return context.user_data["buffer"]
+
+
+def _kb():
+    """Клавіатура з кнопками."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Створити задачу", callback_data="new_task")],
-        [InlineKeyboardButton("🧹 Очистити чернетку", callback_data="clear_buf")]
+        [InlineKeyboardButton("➕ Додати текст", callback_data="add_text")],
+        [InlineKeyboardButton("📌 Створити задачу", callback_data="new_task")],
+        [InlineKeyboardButton("🧹 Очистити", callback_data="clear_buf")],
     ])
 
-# -----------------------
-# КОМАНДИ
-# -----------------------
+
+# -------------------------
+# СТАРТ
+# -------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привіт! Надсилай текст, голос або фото.\n"
-        "Коли завершиш — натисни кнопку, щоб створити задачу.",
-        reply_markup=_kb()
+        "Бот працює. Надішли текст, фото або голосове повідомлення.\n"
+        "Можеш зібрати чернетку та натиснути «Створити задачу».",
+        reply_markup=_kb(),
     )
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот працює!")
 
-# -----------------------
-# ТЕКСТ
-# -----------------------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    _buf(context).append(text)
+# -------------------------
+# ОБРОБКА ЗВИЧАЙНИХ ПОВІДОМЛЕНЬ
+# -------------------------
+
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buf = _buf(context)
+    buf.append(update.message.text)
+
     await update.message.reply_text(
-        "💾 Додано до чернетки.",
-        reply_markup=_kb()
+        "✅ Текст додано у чернетку.",
+        reply_markup=_kb(),
     )
 
-# -----------------------
-# ГОЛОС
-# -----------------------
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice_or_audio = update.message.voice or update.message.audio
-    if not voice_or_audio:
-        await update.message.reply_text("⚠️ Не вдалося отримати аудіо.", reply_markup=_kb())
-        return
-    tg_file = await voice_or_audio.get_file()
-    tmp = "voice.ogg"
-    await tg_file.download_to_drive(tmp)
+
+async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buf = _buf(context)
+
     try:
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, transcribe_audio, tmp)
-        if text:
-            _buf(context).append(text)
-            await update.message.reply_text(f"🧠 Розпізнано:\n{text}", reply_markup=_kb())
-        else:
-            await update.message.reply_text("😕 Не вдалося розпізнати.", reply_markup=_kb())
+        file = await update.message.photo[-1].get_file()
+        local_path = "photo.jpg"
+        await file.download_to_drive(local_path)
+
+        text = extract_text_from_image(local_path)
+        buf.append(text)
+
+        await update.message.reply_text(
+            "🖼 Текст із фото додано.",
+            reply_markup=_kb(),
+        )
+
     except Exception as e:
         logger.exception(e)
-        await update.message.reply_text("❌ Помилка розпізнавання.", reply_markup=_kb())
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        await update.message.reply_text("❌ Помилка розпізнавання фото.")
 
-# -----------------------
-# ФОТО
-# -----------------------
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        await update.message.reply_text("⚠️ Фото не знайдено.", reply_markup=_kb())
-        return
-    tg_file = await update.message.photo[-1].get_file()
-    tmp = "photo.jpg"
-    await tg_file.download_to_drive(tmp)
+
+async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buf = _buf(context)
+
     try:
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, extract_text_from_image, tmp)
-        if text:
-            _buf(context).append(text)
-            await update.message.reply_text(f"📄 Розпізнано текст:\n{text}", reply_markup=_kb())
-        else:
-            await update.message.reply_text("😕 Текст не знайдено.", reply_markup=_kb())
+        file = await update.message.voice.get_file()
+        local_path = "voice.ogg"
+        await file.download_to_drive(local_path)
+
+        text = transcribe_audio(local_path)
+        buf.append(text)
+
+        await update.message.reply_text(
+            "🎤 Розпізнано і додано до чернетки.",
+            reply_markup=_kb(),
+        )
+
     except Exception as e:
         logger.exception(e)
-        await update.message.reply_text("❌ Помилка розпізнавання.", reply_markup=_kb())
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        await update.message.reply_text("❌ Помилка розпізнавання голосу.")
 
-# -----------------------
-# КНОПКИ
-# -----------------------
+
+# -------------------------
+# ОБРОБКА КНОПОК
+# -------------------------
+
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     buf = _buf(context)
 
+    # Очистити буфер
     if q.data == "clear_buf":
         buf.clear()
-        await q.edit_message_text("🧹 Чернетку очищено.")
+        await q.message.reply_text("🧹 Чернетку очищено.", reply_markup=_kb())
         return
 
+    # Створити задачу
     if q.data == "new_task":
         if not buf:
-            await q.edit_message_text("⚠️ Чернетка порожня.")
+            await q.message.reply_text("⚠️ Чернетка порожня.", reply_markup=_kb())
             return
+
         text = "\n".join(buf)
+
         try:
             append_task("Задача", text, "#інше")
-            await q.edit_message_text("✅ Задачу створено!")
+            await q.message.reply_text("✅ Задачу створено!", reply_markup=_kb())
         except Exception as e:
             logger.exception(e)
-            await q.edit_message_text("❌ Помилка запису у таблицю.")
+            await q.message.reply_text("❌ Помилка запису у таблицю.")
+
         buf.clear()
+        return
 
-# -----------------------
-# ОБРОБНИКИ
-# -----------------------
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("ping", ping))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-application.add_handler(CallbackQueryHandler(buttons))
 
-# -----------------------
-# FLASK
-# -----------------------
-@app.route("/")
-def home():
-    return "Бот працює ✅"
+# -------------------------
+# WEBHOOK
+# -------------------------
 
-@app.route("/webhook", methods=["POST"])
+@flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put_nowait(update)
-        return "ok", 200
-    except Exception as e:
-        logger.exception(e)
-        return "error", 500
+    """Точка входу від Telegram."""
+    data = request.get_json(force=True)
+    update = Update.de_json(data, bot_app.bot)
+    bot_app.update_queue.put_nowait(update)
+    return "ok"
 
-# -----------------------
+
+# -------------------------
 # ЗАПУСК
-# -----------------------
+# -------------------------
+
+async def run_webhook():
+    await bot_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+
+
+def start_bot():
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CallbackQueryHandler(buttons))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
+    bot_app.add_handler(MessageHandler(filters.PHOTO, photo_message))
+    bot_app.add_handler(MessageHandler(filters.VOICE, voice_message))
+
+    bot_app.run_webhook(
+        listen="0.0.0.0",
+        port=10000,
+        webhook_url=f"{WEBHOOK_URL}/webhook",
+        drop_pending_updates=True,
+    )
+
+
 if __name__ == "__main__":
-    async def run_bot():
-        await application.initialize()
-        await application.start()
-        logger.info("✅ Telegram application started (webhook mode)")
-        # нескінченний цикл, щоб бот не засинав
-        while True:
-            await asyncio.sleep(60)
-
-    def start_bot():
-        asyncio.run(run_bot())
-
-    thread = threading.Thread(target=start_bot, daemon=True)
-    thread.start()
+    start_bot()
 
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Запуск Flask на порті {port}")
