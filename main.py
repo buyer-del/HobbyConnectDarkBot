@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from flask import Flask, request
 from telegram import (
     Update,
@@ -84,8 +85,10 @@ async def photo_message(update, context):
     except Exception:
         await update.message.reply_text("❌ Помилка розпізнавання фото.")
     finally:
-        try: os.remove(path)
-        except: pass
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 async def voice_message(update, context):
@@ -99,8 +102,10 @@ async def voice_message(update, context):
     except Exception:
         await update.message.reply_text("❌ Помилка голосу.")
     finally:
-        try: os.remove(path)
-        except: pass
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 # ======================
@@ -133,15 +138,21 @@ async def buttons(update, context):
 # ======================
 # FLASK WEBHOOK
 # ======================
-@flask_app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
     update = Update.de_json(data, bot_app.bot)
 
-    # ✅ прямо зараз запускаємо обробку апдейта
-    asyncio.create_task(bot_app.process_update(update))
+    # Обробляємо апдейт без черги, одразу (надійно у Flask-контексті)
+    asyncio.run(bot_app.process_update(update))
 
     return "ok"
+
+
+# (необов'язково) healthcheck для кореня — щоб 404 / не лякав у логах
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    return "ok", 200
 
 
 # ======================
@@ -156,12 +167,11 @@ def main():
     bot_app.add_handler(CallbackQueryHandler(buttons))
 
     # Встановлюємо вебхук
-    import asyncio
     asyncio.get_event_loop().run_until_complete(
         bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
     )
 
-    # Запускаємо Flask (Render вимагає запуск сервера)
+    # Запускаємо Flask (Render вимагає активний HTTP-сервер)
     app.run(host="0.0.0.0", port=PORT)
 
 
