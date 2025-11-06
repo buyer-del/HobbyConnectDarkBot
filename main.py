@@ -4,44 +4,42 @@ import asyncio
 from flask import Flask, request
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters,
 )
 from ai import transcribe_audio, extract_text_from_image
 from sheets_api import append_task
 
-# ======================
-# ЛОГИ
-# ======================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ======================
-# ЗМІННІ
-# ======================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://hobbyconnectdarkbot.onrender.com
+PORT = int(os.getenv("PORT", 10000))
 
-app = Flask(__name__)  # Flask-сервер
+# Flask app
+flask_app = Flask(__name__)
 
-# Telegram App
+# Telegram Application
 bot_app = Application.builder().token(TOKEN).build()
 
 
-# ======================
-# ДОПОМІЖНЕ
-# ======================
+# -------------------------
+# INTERNAL HELPERS
+# -------------------------
+
 def _buf(context):
-    return context.user_data.setdefault("buffer", [])
+    if "buffer" not in context.user_data:
+        context.user_data["buffer"] = []
+    return context.user_data["buffer"]
 
 
 def _kb():
@@ -51,67 +49,72 @@ def _kb():
     ])
 
 
-# ======================
-# КОМАНДИ
-# ======================
+# -------------------------
+# COMMANDS
+# -------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот працює. Можеш надсилати текст, фото або голос. "
-        "Усе додається у чернетку.",
+        "Бот працює. Надішли текст, фото або голос — усе піде в чернетку.",
         reply_markup=_kb(),
     )
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот онлайн")
+    await update.message.reply_text("pong ✅")
 
 
-# ======================
-# ПОВІДОМЛЕННЯ
-# ======================
-async def text_message(update, context):
-    _buf(context).append(update.message.text)
-    await update.message.reply_text("✅ Додано в чернетку.", reply_markup=_kb())
+# -------------------------
+# MESSAGE HANDLERS
+# -------------------------
+
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buf = _buf(context)
+    buf.append(update.message.text)
+
+    await update.message.reply_text(
+        "✅ Текст додано у чернетку.",
+        reply_markup=_kb(),
+    )
 
 
-async def photo_message(update, context):
-    file = await update.message.photo[-1].get_file()
-    path = "photo.jpg"
-    await file.download_to_drive(path)
+async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buf = _buf(context)
     try:
-        text = extract_text_from_image(path)
-        _buf(context).append(text)
+        file = await update.message.photo[-1].get_file()
+        local_path = "photo.jpg"
+        await file.download_to_drive(local_path)
+
+        text = extract_text_from_image(local_path)
+        buf.append(text)
+
         await update.message.reply_text("🖼 Текст із фото додано.", reply_markup=_kb())
-    except Exception:
+    except Exception as e:
+        logger.exception(e)
         await update.message.reply_text("❌ Помилка розпізнавання фото.")
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
 
 
-async def voice_message(update, context):
-    file = await update.message.voice.get_file()
-    path = "voice.ogg"
-    await file.download_to_drive(path)
+async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buf = _buf(context)
     try:
-        text = transcribe_audio(path)
-        _buf(context).append(text)
-        await update.message.reply_text("🎤 Голос додано.", reply_markup=_kb())
-    except Exception:
-        await update.message.reply_text("❌ Помилка голосу.")
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+        file = await update.message.voice.get_file()
+        local_path = "voice.ogg"
+        await file.download_to_drive(local_path)
+
+        text = transcribe_audio(local_path)
+        buf.append(text)
+
+        await update.message.reply_text("🎤 Голос розпізнано й додано.", reply_markup=_kb())
+    except Exception as e:
+        logger.exception(e)
+        await update.message.reply_text("❌ Помилка розпізнавання голосу.")
 
 
-# ======================
-# КНОПКИ
-# ======================
-async def buttons(update, context):
+# -------------------------
+# BUTTON HANDLER
+# -------------------------
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     buf = _buf(context)
 
@@ -126,53 +129,65 @@ async def buttons(update, context):
             return
 
         text = "\n".join(buf)
+
         try:
             append_task("Задача", text, "#інше")
             await q.message.reply_text("✅ Задачу створено!", reply_markup=_kb())
-        except Exception:
-            await q.message.reply_text("❌ Помилка запису.")
+        except Exception as e:
+            logger.exception(e)
+            await q.message.reply_text("❌ Помилка запису у таблицю.")
+
         buf.clear()
         return
 
 
-# ======================
+# -------------------------
 # FLASK WEBHOOK
-# ======================
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, bot_app.bot)
+# -------------------------
 
-    # Обробляємо апдейт без черги, одразу (надійно у Flask-контексті)
-    asyncio.run(bot_app.process_update(update))
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        data = request.get_json(force=True)
+        update = Update.de_json(data, bot_app.bot)
+
+        # Process update through PTB
+        asyncio.get_event_loop().create_task(bot_app.process_update(update))
+
+    except Exception as e:
+        logger.error("Webhook error", exc_info=e)
 
     return "ok"
 
 
-# (необов'язково) healthcheck для кореня — щоб 404 / не лякав у логах
-@app.route("/", methods=["GET", "HEAD"])
-def root():
-    return "ok", 200
+# -------------------------
+# MAIN STARTUP
+# -------------------------
 
-
-# ======================
-# ЗАПУСК
-# ======================
 def main():
+    # Register handlers
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
+    bot_app.add_handler(CallbackQueryHandler(buttons))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     bot_app.add_handler(MessageHandler(filters.PHOTO, photo_message))
     bot_app.add_handler(MessageHandler(filters.VOICE, voice_message))
-    bot_app.add_handler(CallbackQueryHandler(buttons))
 
-    # Встановлюємо вебхук
-    asyncio.get_event_loop().run_until_complete(
+    loop = asyncio.get_event_loop()
+
+    # ✅ Critical: initialize PTB manually
+    loop.run_until_complete(bot_app.initialize())
+
+    # ✅ Set webhook
+    loop.run_until_complete(
         bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
     )
 
-    # Запускаємо Flask (Render вимагає активний HTTP-сервер)
-    app.run(host="0.0.0.0", port=PORT)
+    # ✅ Start PTB processing engine
+    loop.run_until_complete(bot_app.start())
+
+    # ✅ Start Flask server
+    flask_app.run(host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
