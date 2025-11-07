@@ -1,105 +1,168 @@
 # ============================================
-#  🔊 Аудіо → Google Speech-to-Text (українська)
+#  🔊 Аудіо → Google Speech-to-Text (uk-UA)
 #  🖼️ Зображення → Google Vision API (OCR)
 # ============================================
 
 import os
-import json
-from google.cloud import speech
-from google.cloud import vision
-from pydub import AudioSegment
 import io
+import subprocess
+import tempfile
+from typing import Optional
 
-# ---- Google Speech-to-Text з Replit Secrets ----
-def _setup_google_credentials():
-    """Налаштовує Google Cloud credentials з Replit Secrets"""
+from google.cloud import speech_v1 as speech
+from google.cloud import vision
+
+# -----------------------------
+# Налаштування Google Credentials
+# -----------------------------
+def _setup_google_credentials() -> None:
+    """
+    Налаштовує GOOGLE_APPLICATION_CREDENTIALS на основі
+    змінної середовища GOOGLE_CREDENTIALS_JSON (як у твоєму коді).
+    """
     google_creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not google_creds_json:
-        raise ValueError("❌ GOOGLE_CREDENTIALS_JSON не знайдено у Replit Secrets!")
-    
-    # Зберігаємо credentials у тимчасовий файл
+        raise ValueError("❌ GOOGLE_CREDENTIALS_JSON не знайдено у змінних середовища!")
+
     creds_path = "/tmp/google_credentials.json"
-    with open(creds_path, "w") as f:
+    with open(creds_path, "w", encoding="utf-8") as f:
         f.write(google_creds_json)
-    
-    # Встановлюємо змінну середовища для Google SDK
+
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
 
-# Викликаємо один раз при імпорті модуля
 _setup_google_credentials()
 
+# Мова розпізнавання (за потреби можна змінити через SPEECH_LANGUAGE)
+SPEECH_LANGUAGE = os.getenv("SPEECH_LANGUAGE", "uk-UA")
 
-def transcribe_audio(file_path: str) -> str:
+
+# -----------------------------
+# Допоміжне: конвертація → WAV
+# -----------------------------
+def _convert_to_wav_16k_mono(input_path: str) -> str:
+    """
+    Конвертує будь-яке аудіо/відео в WAV PCM 16-bit, mono, 16000 Hz.
+    Вимагає наявності ffmpeg у середовищі (на Render він зазвичай є).
+    Повертає шлях до тимчасового .wav файлу.
+    """
+    fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+
+    # -vn: відкинути відео (на випадок .mp4/.webm)
+    # -ac 1: моно
+    # -ar 16000: 16 кГц
+    # -sample_fmt s16: 16-бітний PCM
+    cmd = [
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
+        "-y",
+        "-i", input_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-sample_fmt", "s16",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        # Якщо ffmpeg не зміг сконвертувати
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+        raise RuntimeError(f"ffmpeg: помилка конвертації ({e})")
+
+    return out_path
+
+
+# -----------------------------
+# Google Speech-to-Text
+# -----------------------------
+def transcribe_audio(input_path: str) -> Optional[str]:
     """
     Розпізнає українську мову з аудіо через Google Speech-to-Text.
-    Підтримує різні формати (.ogg, .mp3, .m4a, .wav тощо).
+    1) Завжди конвертує у WAV PCM 16k/16-bit/mono
+    2) Виконує розпізнавання
+    3) Повертає текст або None (якщо не розпізнано/помилка)
+
+    ВАЖЛИВО: Ми повертаємо None на невдачу, бо main.py показує власне повідомлення
+    про помилку — це зберігає поточну поведінку бота.
     """
+    wav_path = None
     try:
-        # 1. Конвертуємо будь-яке аудіо у WAV 16kHz mono
-        wav_path = file_path + ".wav"
-        sound = AudioSegment.from_file(file_path)
-        sound = sound.set_frame_rate(16000).set_channels(1)
-        sound.export(wav_path, format="wav")
+        # Конвертація у WAV
+        wav_path = _convert_to_wav_16k_mono(input_path)
 
-        # 2. Завантажуємо аудіо у пам'ять
-        with io.open(wav_path, "rb") as audio_file:
-            content = audio_file.read()
+        # Читаємо бінарний вміст
+        with open(wav_path, "rb") as f:
+            content = f.read()
 
-        # 3. Налаштування клієнта Speech API
-        client = speech.SpeechClient()
         audio = speech.RecognitionAudio(content=content)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=16000,
-            language_code="uk-UA",
+            language_code=SPEECH_LANGUAGE,
             enable_automatic_punctuation=True,
+            # "latest_long" добре працює з фразами; за потреби можна "default"
+            model="latest_long",
         )
 
-        # 4. Відправляємо запит до Google Speech-to-Text
+        client = speech.SpeechClient()
         response = client.recognize(config=config, audio=audio)
 
-        # 5. Очищаємо тимчасові файли
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-
-        # 6. Отримуємо результат
+        # Якщо немає результатів
         if not response.results:
-            return "(мову не розпізнано)"
+            return None
 
-        text = " ".join([result.alternatives[0].transcript for result in response.results])
-        return text.strip()
+        parts = []
+        for result in response.results:
+            if result.alternatives:
+                parts.append(result.alternatives[0].transcript)
+
+        text = " ".join(t.strip() for t in parts if t and t.strip())
+        return text if text else None
 
     except Exception as e:
-        return f"Помилка транскрипції: {e}"
+        # Логіку повідомлення користувачу робить main.py,
+        # тому тут повертаємо None, щоб main показав свою фразу.
+        return None
+
+    finally:
+        # Прибираємо тимчасовий .wav файл
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
 
-# --- Google Vision API (розпізнавання тексту з картинок) ---
-from google.cloud import vision
-
-def extract_text_from_image(image_path: str) -> str:
+# -----------------------------
+# Google Vision OCR
+# -----------------------------
+def extract_text_from_image(image_path: str) -> Optional[str]:
     """
-    Розпізнає текст з зображення через Google Vision API.
-    Підтримує українську мову та багато інших.
+    Розпізнає текст із зображення через Google Vision API.
+    Повертає рядок або None.
     """
     try:
-        # Ініціалізуємо Vision API client
         client = vision.ImageAnnotatorClient()
 
-        # Читаємо зображення
-        with io.open(image_path, 'rb') as image_file:
+        with open(image_path, "rb") as image_file:
             content = image_file.read()
 
         image = vision.Image(content=content)
-
-        # Розпізнаємо текст
         response = client.text_detection(image=image)
-        texts = response.text_annotations
 
-        if texts:
-            # Перший елемент містить весь текст
-            return texts[0].description.strip()
-        else:
-            return "(текст не розпізнано)"
+        if response.error.message:
+            # Прокидуємо як виняток, щоб верхній рівень показав повідомлення про помилку
+            raise RuntimeError(f"Vision API error: {response.error.message}")
 
-    except Exception as e:
-        return f"Помилка OCR: {e}"
+        if not response.text_annotations:
+            return None
+
+        full_text = (response.text_annotations[0].description or "").strip()
+        return full_text or None
+
+    except Exception:
+        return None
